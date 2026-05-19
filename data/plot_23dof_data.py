@@ -31,7 +31,6 @@ def plot_data(t, X, labels, title, n_cols=5, overlays=None, save_path=None):
     overlays: optional dict {subplot_index -> (num, T) array} drawn as dashed
               lines matching each trajectory's color.
     """
-
     n_dim = X.shape[2]
     n_rows = (n_dim + n_cols - 1) // n_cols
 
@@ -118,9 +117,6 @@ def main():
     cmd_ang_world = body_to_world(quat_sel, cmd_ang_body)                    # (num, T, 3)
 
     # overlay world-frame cmd on the matching base-velocity subplots:
-    #   V_LABELS[0]=vx → cmd_lin_world[..., 0]
-    #   V_LABELS[1]=vy → cmd_lin_world[..., 1]
-    #   V_LABELS[5]=wz → cmd_ang_world[..., 2]
     v_overlays = {
         0: cmd_lin_world[:, :, 0],
         1: cmd_lin_world[:, :, 1],

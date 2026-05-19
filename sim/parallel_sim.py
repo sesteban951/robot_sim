@@ -24,7 +24,7 @@ import warp as wp
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from policy.actor import load_policy
 from policy.config import G1Config
-from utils.math_utils import get_gravity_orientation_batch
+from utils.math_utils import get_gravity_orientation_batch, q_to_rom, v_to_rom
 
 
 ############################################################################
@@ -432,6 +432,7 @@ if __name__ == "__main__":
 
     # environment name (used for file naming)
     env_name = "g1_23dof"
+    rom_env_name = "g1_rom"
 
     # rollout parameters
     batch_size = 1024
@@ -462,9 +463,9 @@ if __name__ == "__main__":
     # create the rollout instance
     r = ParallelSim(config)
 
-    # function to rollout and save a dataset, 
+    # function to rollout and save full-order + ROM datasets,
     # returns time it took to complete the rollout (excluding saving time)
-    def rollout_and_save_dataset(save_path, label):
+    def rollout_and_save_dataset(save_path, rom_save_path, label):
 
         print(f"\nGenerating {label}...")
 
@@ -478,28 +479,47 @@ if __name__ == "__main__":
         v_log_np = v_log.cpu().numpy()
         cmd_log_np = cmd_log.cpu().numpy()
 
-        print(f"  q_log:   {q_log_np.shape}")
-        print(f"  v_log:   {v_log_np.shape}")
-        print(f"  cmd_log: {cmd_log_np.shape}")
+        # derive ROM state: q_rom = [px, py, theta] (world frame),
+        # v_rom = [vx, vy, omega_z] (body frame, matches body-frame cmd input)
+        q_rom_log_np = q_to_rom(q_log_np)              # (B, T, 3)
+        v_rom_log_np = v_to_rom(q_log_np, v_log_np)    # (B, T, 3)
 
+        print(f"  q_log:       {q_log_np.shape}")
+        print(f"  v_log:       {v_log_np.shape}")
+        print(f"  cmd_log:     {cmd_log_np.shape}")
+        print(f"  q_rom_log:   {q_rom_log_np.shape}")
+        print(f"  v_rom_log:   {v_rom_log_np.shape}")
+
+        # full-order save
         np.savez(save_path,
                  sim_dt=float(r.sim_dt),
                  control_dt=float(r.control_dt),
                  q_log=q_log_np,
                  v_log=v_log_np,
                  cmd_log=cmd_log_np)
-        print(f"  Saved to: {save_path}")
+        print(f"  Saved full-order to: {save_path}")
+
+        # ROM save
+        np.savez(rom_save_path,
+                 sim_dt=float(r.sim_dt),
+                 control_dt=float(r.control_dt),
+                 q_rom_log=q_rom_log_np,
+                 v_rom_log=v_rom_log_np,
+                 cmd_log=cmd_log_np)
+        print(f"  Saved ROM to:        {rom_save_path}")
 
         return rollout_time
 
-    # generate numbered datasets: <env_name>_data_XX.npz
+    # generate numbered datasets: <env_name>_data_XX.npz (full order)
+    #                             <rom_env_name>_data_XX.npz (ROM)
     tot_time = 0.0
     save_dir = "./data/data"
     os.makedirs(save_dir, exist_ok=True)
 
     for i in range(N_datasets):
         save_path = f"{save_dir}/{env_name}_data_{i+1:02d}.npz"
-        tot_time += rollout_and_save_dataset(save_path, f"dataset {i+1}/{N_datasets}")
+        rom_save_path = f"{save_dir}/{rom_env_name}_data_{i+1:02d}.npz"
+        tot_time += rollout_and_save_dataset(save_path, rom_save_path, f"dataset {i+1}/{N_datasets}")
 
     print(f"\nFinished generating {N_datasets} datasets.")
     print(f"Total rollout time: {tot_time:.1f}s")
