@@ -47,9 +47,8 @@ class G1Config:
 
     # gait
     gait_period: float = 0.6
-    stand_cmd_threshold: float = 0.05 # set to = 0.0 to always moving feet
+    stand_cmd_threshold: float = 0.05 # set to 0.0 to always moving feet
 
     # velocity command [vx, vy, omega]
     cmd_scale: np.ndarray = field(default_factory=lambda: np.array([0.75, 0.75, 1.0]))
-    cmd_default: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 0.0]))
     cmd: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float32))

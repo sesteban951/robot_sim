@@ -30,7 +30,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from policy.actor import load_policy
 from policy.config import G1Config
-from utils.joystick_utils import JoystickState, pygame_to_joystick_state
+from utils.joystick_utils import pygame_to_joystick_state
 from utils.math_utils import gravity_from_quat
 
 # fixed viewer render rate (Hz). Physics still runs at args.sim_dt.
@@ -192,9 +192,6 @@ def main():
 
     # joystick (optional — only used if connected at startup)
     joy = init_joystick()
-
-    # initialize the live cmd from cmd_default
-    robot_cfg.cmd = np.asarray(robot_cfg.cmd_default, dtype=np.float32).copy()
 
     # mujoco viewer setup
     render_dt = 1.0 / RENDER_HZ

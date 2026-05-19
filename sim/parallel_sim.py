@@ -53,6 +53,11 @@ class ParallelSimConfig:
     v_lb: np.ndarray = None                    # lower bound on initial qvel, shape (nv,)
     v_ub: np.ndarray = None                    # upper bound on initial qvel, shape (nv,)
 
+    # cmd randomization: resample per-env cmd uniformly from [cmd_lb, cmd_ub], 
+    cmd_zoh_steps: int = None                  # control queries per ZOH window (defaults to new command at every policy query)
+    cmd_lb: np.ndarray = None                  # cmd sample lower bound, shape (3,); clipped to [-cmd_scale, +cmd_scale]; default = -cmd_scale
+    cmd_ub: np.ndarray = None                  # cmd sample upper bound, shape (3,); clipped to [-cmd_scale, +cmd_scale]; default = +cmd_scale
+
 
 ############################################################################
 # PARALLEL SIM CLASS
@@ -89,9 +94,38 @@ class ParallelSim:
         self.action_scale = torch.tensor(
             self.robot_cfg.action_scale, dtype=torch.float32, device=self.device
         )
+        self.cmd_scale = torch.tensor(
+            self.robot_cfg.cmd_scale, dtype=torch.float32, device=self.device
+        )  # (3,) clamp limit for cmd sample bounds (default box = ±cmd_scale)
+
+        # per-dim cmd sample bounds (clipped to [-cmd_scale, +cmd_scale])
+        if config.cmd_lb is None:
+            cmd_lb_t = -self.cmd_scale.clone()
+        else:
+            cmd_lb_t = torch.tensor(
+                np.asarray(config.cmd_lb, dtype=np.float32),
+                dtype=torch.float32, device=self.device,
+            )
+            if cmd_lb_t.shape != (3,):
+                raise ValueError(f"cmd_lb must have shape (3,), got {tuple(cmd_lb_t.shape)}")
+        if config.cmd_ub is None:
+            cmd_ub_t = +self.cmd_scale.clone()
+        else:
+            cmd_ub_t = torch.tensor(
+                np.asarray(config.cmd_ub, dtype=np.float32),
+                dtype=torch.float32, device=self.device,
+            )
+            if cmd_ub_t.shape != (3,):
+                raise ValueError(f"cmd_ub must have shape (3,), got {tuple(cmd_ub_t.shape)}")
+        self.cmd_lb = torch.clamp(cmd_lb_t, -self.cmd_scale, +self.cmd_scale)
+        self.cmd_ub = torch.clamp(cmd_ub_t, -self.cmd_scale, +self.cmd_scale)
+
+        # writable (B, 3) cmd buffer — repeated rather than expanded so we can resample it
         self.cmd = torch.tensor(
             self.robot_cfg.cmd, dtype=torch.float32, device=self.device
-        ).unsqueeze(0).expand(self.batch_size, -1)  # (N, 3)
+        ).unsqueeze(0).repeat(self.batch_size, 1).contiguous()  # (B, 3)
+        # None defaults to 1: resample cmd at every control query
+        self.cmd_zoh_steps = 1 if config.cmd_zoh_steps is None else int(config.cmd_zoh_steps)
 
         # timing
         self.control_dt = self.robot_cfg.control_dt
@@ -154,11 +188,11 @@ class ParallelSim:
             )
 
         # zero-copy torch views into warp arrays
-        self.t_qpos = wp.to_torch(self.wp_data.qpos)        # (N, nq)
-        self.t_qvel = wp.to_torch(self.wp_data.qvel)        # (N, nv)
-        self.t_ctrl = wp.to_torch(self.wp_data.ctrl)        # (N, nu)
-        self.t_sensordata = wp.to_torch(self.wp_data.sensordata)  # (N, nsensordata)
-        self.t_time = wp.to_torch(self.wp_data.time)        # (N,)
+        self.t_qpos = wp.to_torch(self.wp_data.qpos)        # (B, nq)
+        self.t_qvel = wp.to_torch(self.wp_data.qvel)        # (B, nv)
+        self.t_ctrl = wp.to_torch(self.wp_data.ctrl)        # (B, nu)
+        self.t_sensordata = wp.to_torch(self.wp_data.sensordata)  # (B, nsensordata)
+        self.t_time = wp.to_torch(self.wp_data.time)        # (B,)
 
         print(f"MuJoCo Warp initialized: nq={self.nq}, nv={self.nv}, nu={self.nu}")
         print(f"  sim_dt=[{self.sim_dt} sec]")
@@ -170,11 +204,6 @@ class ParallelSim:
         self.policy = load_policy(config.policy_path, self.device)
         print(f"Loaded policy from [{config.policy_path}].")
 
-        # pre-allocate observation buffer
-        self.obs_size = 80
-        self.obs_buf = torch.zeros(self.batch_size, self.obs_size,
-                                   dtype=torch.float32, device=self.device)
-
     # ------------------------------------------------------------------ #
     #  Observation
     # ------------------------------------------------------------------ #
@@ -184,39 +213,39 @@ class ParallelSim:
         Build the 80-dim observation vector from simulation state.
 
         Args:
-            prev_action: (N, 23) previous policy output
-            sim_time:    (N,)    simulation time per env
+            prev_action: (B, 23) previous policy output
+            sim_time:    (B,)    simulation time per env
         Returns:
-            obs: (N, 80)
+            obs: (B, 80)
         """
         # from sensordata: pelvis gyro (body-frame angular velocity)
-        # sensor layout: torso_quat(4), torso_gyro(3), torso_acc(3),  [0:10]
+        # sensor layout: torso_quat(4), torso_gyro(3), torso_acc(3),   [0:10]
         #                pelvis_quat(4), pelvis_gyro(3), pelvis_acc(3) [10:20]
         #                left_foot_touch(1), right_foot_touch(1)       [20:22]
-        omega_body = self.t_sensordata[:, 14:17]       # (N, 3)
+        omega_body = self.t_sensordata[:, 14:17]       # (B, 3)
 
         # base quaternion for gravity projection
-        quat = self.t_qpos[:, 3:7]                     # (N, 4)
-        gravity = get_gravity_orientation_batch(quat)   # (N, 3)
+        quat = self.t_qpos[:, 3:7]                     # (B, 4)
+        gravity = get_gravity_orientation_batch(quat)   # (B, 3)
 
         # joint state
-        qpos_joints = self.t_qpos[:, 7:7 + self.nu]   # (N, 23)
-        qvel_joints = self.t_qvel[:, 6:6 + self.nu]   # (N, 23)
+        qpos_joints = self.t_qpos[:, 7:7 + self.nu]   # (B, 23)
+        qvel_joints = self.t_qvel[:, 6:6 + self.nu]   # (B, 23)
 
         # gait phase clock
-        phase = (sim_time % self.gait_period) / self.gait_period  # (N,)
+        phase = (sim_time % self.gait_period) / self.gait_period  # (B,)
         two_pi = 2.0 * math.pi
-        gait_sin = torch.sin(two_pi * phase)   # (N,)
-        gait_cos = torch.cos(two_pi * phase)   # (N,)
-        gait_phase = torch.stack([gait_sin, gait_cos], dim=-1)  # (N, 2)
+        gait_sin = torch.sin(two_pi * phase)   # (B,)
+        gait_cos = torch.cos(two_pi * phase)   # (B,)
+        gait_phase = torch.stack([gait_sin, gait_cos], dim=-1)  # (B, 2)
 
         # zero gait phase when command is below threshold
-        cmd_norm = torch.norm(self.cmd, dim=-1)  # (N,)
+        cmd_norm = torch.norm(self.cmd, dim=-1)  # (B,)
         standing = (cmd_norm < self.robot_cfg.stand_cmd_threshold)
         gait_phase[standing] = 0.0
 
         # joint position error
-        qj_err = qpos_joints - self.default_joint_pos  # (N, 23)
+        qj_err = qpos_joints - self.default_joint_pos  # (B, 23)
 
         # assemble observation:
         # [omega(3), gravity(3), cmd(3), phase(2), qj_err(23), dqj(23), prev_action(23)]
@@ -241,9 +270,9 @@ class ParallelSim:
         PD control: action → desired position → torque.
 
         Args:
-            action: (N, 23) raw policy output
+            action: (B, 23) raw policy output
         Returns:
-            tau: (N, 23)
+            tau: (B, 23)
         """
         qpos_des = action * self.action_scale + self.default_joint_pos
         qpos_joints = self.t_qpos[:, 7:7 + self.nu]
@@ -260,18 +289,28 @@ class ParallelSim:
         Sample initial conditions uniformly from configured q/v bounds.
 
         Returns:
-            q0_batch: (N, nq) initial positions
-            v0_batch: (N, nv) initial velocities
+            q0_batch: (B, nq) initial positions
+            v0_batch: (B, nv) initial velocities
         """
-        N = self.batch_size
+        B = self.batch_size
 
-        q_rand = torch.rand(N, self.nq, dtype=torch.float32, device=self.device, generator=self.rng)
-        v_rand = torch.rand(N, self.nv, dtype=torch.float32, device=self.device, generator=self.rng)
+        q_rand = torch.rand(B, self.nq, dtype=torch.float32, device=self.device, generator=self.rng)
+        v_rand = torch.rand(B, self.nv, dtype=torch.float32, device=self.device, generator=self.rng)
 
         q0_batch = self.q_lb.unsqueeze(0) + (self.q_ub - self.q_lb).unsqueeze(0) * q_rand
         v0_batch = self.v_lb.unsqueeze(0) + (self.v_ub - self.v_lb).unsqueeze(0) * v_rand
 
         return q0_batch, v0_batch
+
+    # ------------------------------------------------------------------ #
+    #  Command Sampling
+    # ------------------------------------------------------------------ #
+
+    def _sample_cmd(self):
+        """Resample per-env cmd uniformly from box [cmd_lb, cmd_ub]."""
+        u = torch.rand(self.batch_size, 3, dtype=torch.float32,
+                       device=self.device, generator=self.rng)
+        self.cmd = self.cmd_lb.unsqueeze(0) + (self.cmd_ub - self.cmd_lb).unsqueeze(0) * u  # (B, 3)
 
     # ------------------------------------------------------------------ #
     #  Rollout
@@ -284,8 +323,9 @@ class ParallelSim:
         Args:
             T: number of sim steps (T-1 integrations, logged at sim_dt)
         Returns:
-            q_log: (N, T, nq) joint positions
-            v_log: (N, T, nv) joint velocities
+            q_log:   (B, T, nq) joint positions
+            v_log:   (B, T, nv) joint velocities
+            cmd_log: (B, T, 3)  per-env cmd in effect at each logged timestep
         """
         q0_batch, v0_batch = self.sample_random_uniform_initial_conditions()
         return self._rollout_policy_input(q0_batch, v0_batch, T)
@@ -294,14 +334,15 @@ class ParallelSim:
         """Run T simulation steps with the policy from given ICs.
 
         Args:
-            q0_batch: (N, nq) initial positions
-            v0_batch: (N, nv) initial velocities
+            q0_batch: (B, nq) initial positions
+            v0_batch: (B, nv) initial velocities
             T:        number of sim steps (T-1 integrations)
         Returns:
-            q_log: (N, T, nq) joint positions  (logged at sim_dt)
-            v_log: (N, T, nv) joint velocities (logged at sim_dt)
+            q_log:   (B, T, nq) joint positions  (logged at sim_dt)
+            v_log:   (B, T, nv) joint velocities (logged at sim_dt)
+            cmd_log: (B, T, 3)  cmd active at each timestep
         """
-        N = self.batch_size
+        B = self.batch_size
         S = T - 1  # number of steps to take (T includes initial state)
 
         # reset data to default state
@@ -316,26 +357,37 @@ class ParallelSim:
             mjwarp.forward(self.wp_model, self.wp_data)
 
         # logging at sim_dt
-        q_log = torch.zeros(N, T, self.nq, dtype=self.log_dtype, device=self.device)
-        v_log = torch.zeros(N, T, self.nv, dtype=self.log_dtype, device=self.device)
+        q_log = torch.zeros(B, T, self.nq, dtype=self.log_dtype, device=self.device)
+        v_log = torch.zeros(B, T, self.nv, dtype=self.log_dtype, device=self.device)
+        cmd_log = torch.zeros(B, T, 3, dtype=self.log_dtype, device=self.device)
+
+        # sample initial cmd
+        self._sample_cmd()
 
         # log initial state
         q_log[:, 0, :] = self.t_qpos.to(self.log_dtype)
         v_log[:, 0, :] = self.t_qvel.to(self.log_dtype)
+        cmd_log[:, 0, :] = self.cmd.to(self.log_dtype)
 
         # initialize previous action
-        prev_action = torch.zeros(N, self.nu, dtype=torch.float32, device=self.device)
+        prev_action = torch.zeros(B, self.nu, dtype=torch.float32, device=self.device)
         action = prev_action
 
         # main rollout loop
+        ctrl_query = 0
         with wp.ScopedDevice("cuda:0"):
             for step in range(S):
                 # update policy every decimation steps
                 if step % self.decimation == 0:
-                    sim_time = self.t_time  # (N,)
+                    # resample cmd on ZOH boundaries (skip query 0 — already sampled above)
+                    if ctrl_query > 0 and ctrl_query % self.cmd_zoh_steps == 0:
+                        self._sample_cmd()
+
+                    sim_time = self.t_time  # (B,)
                     obs = self.build_observation(prev_action, sim_time)
-                    action = self.policy(obs)  # (N, 23)
+                    action = self.policy(obs)  # (B, 23)
                     prev_action = action
+                    ctrl_query += 1
 
                 # PD torque and physics step
                 tau = self.compute_torque(action)
@@ -345,18 +397,20 @@ class ParallelSim:
                 # log state
                 q_log[:, step + 1, :] = self.t_qpos.to(self.log_dtype)
                 v_log[:, step + 1, :] = self.t_qvel.to(self.log_dtype)
+                cmd_log[:, step + 1, :] = self.cmd.to(self.log_dtype)
 
-        return q_log, v_log
+        return q_log, v_log, cmd_log
 
     def rollout_policy_input_x0(self, x0_batch: torch.Tensor, T: int):
         """Run a policy rollout from a stacked state vector x0 = [q, v].
 
         Args:
-            x0_batch: (N, nq+nv) initial states
+            x0_batch: (B, nq+nv) initial states
             T:        number of sim steps (T-1 integrations)
         Returns:
-            q_log: (N, T, nq) joint positions
-            v_log: (N, T, nv) joint velocities
+            q_log:   (B, T, nq) joint positions
+            v_log:   (B, T, nv) joint velocities
+            cmd_log: (B, T, 3)  cmd active at each timestep
         """
         q0_batch = x0_batch[:, :self.nq]
         v0_batch = x0_batch[:, self.nq:self.nq + self.nv]
@@ -381,11 +435,15 @@ if __name__ == "__main__":
 
     # rollout parameters
     batch_size = 1024
-    sim_dt_des = 0.002  # dt for simulation and logging (too low makes sim instability)
+    sim_dt_des = 0.002  # dt for simulation and logging (too coarse causes sim instability)
     T = 2500            # number of sim steps to rollout (e.g., 2500 steps at 2ms sim_dt = 5.0 sec)
 
     # number of datasets to generate
-    N_datasets = 10
+    N_datasets = 3
+
+    # cmd randomization: resample per-env cmd every N policy queries (None = resample every control query)
+    # at control_dt=0.02 s, 125 queries = 2.5 s of hold per ZOH window
+    cmd_zoh_steps = 125
 
     # random seed
     # seed = 0
@@ -398,6 +456,7 @@ if __name__ == "__main__":
         policy_path=policy_path,
         seed=seed,
         sim_dt_des=sim_dt_des,
+        cmd_zoh_steps=cmd_zoh_steps,
     )
 
     # create the rollout instance
@@ -410,22 +469,25 @@ if __name__ == "__main__":
         print(f"\nGenerating {label}...")
 
         t0 = time.time()
-        q_log, v_log = r.rollout_policy_input(T)
+        q_log, v_log, cmd_log = r.rollout_policy_input(T)
         torch.cuda.synchronize()
         rollout_time = time.time() - t0
         print(f"Rollout time: {rollout_time:.3f}s")
 
         q_log_np = q_log.cpu().numpy()
         v_log_np = v_log.cpu().numpy()
+        cmd_log_np = cmd_log.cpu().numpy()
 
-        print(f"  q_log: {q_log_np.shape}")
-        print(f"  v_log: {v_log_np.shape}")
+        print(f"  q_log:   {q_log_np.shape}")
+        print(f"  v_log:   {v_log_np.shape}")
+        print(f"  cmd_log: {cmd_log_np.shape}")
 
         np.savez(save_path,
                  sim_dt=float(r.sim_dt),
                  control_dt=float(r.control_dt),
                  q_log=q_log_np,
-                 v_log=v_log_np)
+                 v_log=v_log_np,
+                 cmd_log=cmd_log_np)
         print(f"  Saved to: {save_path}")
 
         return rollout_time
