@@ -47,7 +47,8 @@ class G1Config:
 
     # gait
     gait_period: float = 0.6
-    stand_cmd_threshold: float = 0.0
+    stand_cmd_threshold: float = 0.0 # set to > 0.0 to diable stepping while zero cmd
 
     # velocity command [vx, vy, omega]
-    cmd: np.ndarray = field(default_factory=lambda: np.array([0.5, 0.0, 0.0]))
+    cmd_scale: np.ndarray = field(default_factory=lambda: np.array([0.75, 0.75, 0.75]))
+    cmd_default: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 0.0]))

@@ -1,7 +1,7 @@
 ##
 #
-#  Deterministic single-environment G1 rollout under the trained policy.
-#  Uses CPU MuJoCo (no warp) and launches the passive viewer for playback.
+#  Real-time, deterministic, single-environment closed-loop simulation of the
+#  G1 humanoid under the trained policy, visualized in the MuJoCo viewer.
 #
 ##
 
@@ -10,16 +10,33 @@ import math
 import os
 import sys
 import time
+import warnings
 
+# silence pygame support warning
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    import pygame
+
+# standard imports
+import numpy as np
+
+# mujoco sim imports
 import mujoco
 import mujoco.viewer
-import numpy as np
+
+# torch imports
 import torch
 import torch.nn as nn
 
-# allow `from policy.config import G1Config` when launched from repo root or this dir
+# for importing policy config and joystick utils
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from policy.config import G1Config
+from utils.joystick_utils import JoystickState, pygame_to_joystick_state
+from utils.math_utils import gravity_from_quat
+
+# fixed viewer render rate (Hz). Physics still runs at args.sim_dt.
+RENDER_HZ = 50.0
 
 
 ############################################################################
@@ -71,17 +88,8 @@ def load_policy(checkpoint_path: str, device: torch.device) -> ActorMLP:
 # OBSERVATION / CONTROL
 ############################################################################
 
-def gravity_from_quat(quat: np.ndarray) -> np.ndarray:
-    """Projected gravity in body frame from base quaternion (w,x,y,z)."""
-    qw, qx, qy, qz = quat
-    gx = 2.0 * (-qz * qx + qw * qy)
-    gy = -2.0 * (qz * qy + qw * qx)
-    gz = 1.0 - 2.0 * (qw * qw + qz * qz)
-    return np.array([gx, gy, gz], dtype=np.float32)
-
-
 def build_observation(mj_data, robot_cfg, prev_action, nu, device):
-    """Build the 80-dim observation vector (matches parallel_sim.py layout)."""
+    """Build the 80-dim observation vector consumed by the policy."""
     omega = mj_data.sensordata[14:17].astype(np.float32)
     quat = mj_data.qpos[3:7].astype(np.float32)
     gravity = gravity_from_quat(quat)
@@ -121,6 +129,40 @@ def compute_torque(action_np, mj_data, robot_cfg, nu):
 
 
 ############################################################################
+# JOYSTICK
+############################################################################
+
+def init_joystick():
+    """Initialize pygame + joystick. Returns the joystick handle or None."""
+    pygame.init()
+    pygame.joystick.init()
+    if pygame.joystick.get_count() == 0:
+        print("No joystick detected. Using default cmd from G1Config.")
+        return None
+    joy = pygame.joystick.Joystick(0)
+    joy.init()
+    print(f"Joystick connected: [{joy.get_name()}]. Driving cmd from joystick.")
+    print("  Left stick:  forward/back -> vx,  left/right -> vy")
+    print("  Right stick: left/right   -> yaw rate")
+    return joy
+
+
+def update_cmd_from_joystick(joy, robot_cfg):
+    """Pump pygame events and write joystick state into robot_cfg.cmd in place."""
+    # consume the event queue (also surfaces connect/disconnect)
+    pygame.event.pump()
+    try:
+        state = pygame_to_joystick_state(joy)
+    except pygame.error:
+        return
+    # remapping matches deploy_robot/joystick_pygame.py; scaled by cmd_scale
+    scale = robot_cfg.cmd_scale
+    robot_cfg.cmd[0] = state.LS_Y * scale[0]   # vx
+    robot_cfg.cmd[1] = state.LS_X * scale[1]   # vy
+    robot_cfg.cmd[2] = state.RS_X * scale[2]   # omega
+
+
+############################################################################
 # MAIN
 ############################################################################
 
@@ -130,12 +172,8 @@ def main():
                         help="path to MuJoCo XML")
     parser.add_argument("--policy", default="policy/g1_23dof_vel.pt",
                         help="path to RSL-RL .pt checkpoint")
-    parser.add_argument("--duration", type=float, default=15.0,
-                        help="rollout length in seconds")
-    parser.add_argument("--sim_dt", type=float, default=0.001,
+    parser.add_argument("--sim_dt", type=float, default=0.002,
                         help="physics timestep")
-    parser.add_argument("--headless", action="store_true",
-                        help="run without the viewer (no real-time pacing)")
     args = parser.parse_args()
 
     # determinism
@@ -171,42 +209,58 @@ def main():
     policy = load_policy(args.policy, device)
     print(f"Loaded policy from [{args.policy}].")
     print(f"sim_dt={args.sim_dt}, control_dt={robot_cfg.control_dt}, "
-          f"decimation={decimation}, duration={args.duration}s")
+          f"decimation={decimation}")
 
-    n_steps = int(round(args.duration / args.sim_dt))
+    # joystick (optional — only used if connected at startup)
+    joy = init_joystick()
+
+    # initialize the live cmd from cmd_default; joystick (if present) mutates it
+    robot_cfg.cmd = np.asarray(robot_cfg.cmd_default, dtype=np.float32).copy()
+
+    render_dt = 1.0 / RENDER_HZ
+    print(f"Viewer render rate: {RENDER_HZ:.0f} Hz. "
+          "Close the viewer window to exit.")
+
     prev_action = np.zeros(nu, dtype=np.float32)
     action = prev_action.copy()
+    step = 0
 
-    def step_once(step):
-        nonlocal prev_action, action
-        if step % decimation == 0:
-            obs = build_observation(mj_data, robot_cfg, prev_action, nu, device)
-            action = policy(obs).squeeze(0).cpu().numpy().astype(np.float32)
-            prev_action = action
-        mj_data.ctrl[:] = compute_torque(action, mj_data, robot_cfg, nu)
-        mujoco.mj_step(mj_model, mj_data)
+    try:
+        with mujoco.viewer.launch_passive(mj_model, mj_data) as viewer:
+            wall_start = time.time()
+            next_render = wall_start
 
-    if args.headless:
-        t0 = time.time()
-        for step in range(n_steps):
-            step_once(step)
-        print(f"Headless rollout done in {time.time() - t0:.2f}s "
-              f"({n_steps} steps).")
-        return
+            while viewer.is_running():
+                # advance physics until sim time catches up to wall-clock time
+                # (cap catch-up at a few render frames to avoid the "spiral of
+                # death" if the host stalls)
+                sim_target = min(
+                    time.time() - wall_start,
+                    mj_data.time + 4.0 * render_dt,
+                )
+                while mj_data.time < sim_target:
+                    if step % decimation == 0:
+                        if joy is not None:
+                            update_cmd_from_joystick(joy, robot_cfg)
+                        obs = build_observation(mj_data, robot_cfg, prev_action, nu, device)
+                        action = policy(obs).squeeze(0).cpu().numpy().astype(np.float32)
+                        prev_action = action
+                    mj_data.ctrl[:] = compute_torque(action, mj_data, robot_cfg, nu)
+                    mujoco.mj_step(mj_model, mj_data)
+                    step += 1
 
-    # interactive viewer with real-time pacing
-    with mujoco.viewer.launch_passive(mj_model, mj_data) as viewer:
-        real_t0 = time.time()
-        for step in range(n_steps):
-            if not viewer.is_running():
-                break
-            step_once(step)
-            viewer.sync()
-            # real-time pacing
-            sim_elapsed = (step + 1) * args.sim_dt
-            real_elapsed = time.time() - real_t0
-            if sim_elapsed > real_elapsed:
-                time.sleep(sim_elapsed - real_elapsed)
+                # render a single frame at the fixed render rate
+                viewer.sync()
+                next_render += render_dt
+                slack = next_render - time.time()
+                if slack > 0:
+                    time.sleep(slack)
+                else:
+                    # fell behind — resync the render clock to "now" so the
+                    # deficit doesn't accumulate forever
+                    next_render = time.time()
+    finally:
+        pygame.quit()
 
 
 if __name__ == "__main__":
