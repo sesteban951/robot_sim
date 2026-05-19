@@ -5,21 +5,20 @@
 #
 ##
 
+# standard imports
 import argparse
 import math
 import os
 import sys
 import time
 import warnings
+import numpy as np
 
 # silence pygame support warning
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 with warnings.catch_warnings():
     warnings.simplefilter("ignore")
     import pygame
-
-# standard imports
-import numpy as np
 
 # mujoco sim imports
 import mujoco
@@ -46,8 +45,12 @@ RENDER_HZ = 50.0
 class ActorMLP(nn.Module):
     """RSL-RL actor MLP with observation normalization."""
 
-    def __init__(self, input_size=80, hidden_sizes=(512, 256, 128), output_size=23):
+    def __init__(self, input_size=80, 
+                       hidden_sizes=(512, 256, 128), 
+                       output_size=23):
         super().__init__()
+
+        # build the MLP
         layers = []
         prev = input_size
         for h in hidden_sizes:
@@ -57,19 +60,24 @@ class ActorMLP(nn.Module):
         layers.append(nn.Linear(prev, output_size))
         self.mlp = nn.Sequential(*layers)
 
+        # observation normalization buffers
         self.register_buffer("obs_mean", torch.zeros(1, input_size))
         self.register_buffer("obs_var", torch.ones(1, input_size))
 
+    # forward pass with no gradients (inference only)
     @torch.no_grad()
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         obs_norm = (obs - self.obs_mean) / torch.sqrt(self.obs_var + 1e-2)
         return self.mlp(obs_norm)
 
 
+# load a pytorch policy
 def load_policy(checkpoint_path: str, device: torch.device) -> ActorMLP:
+
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     actor_sd = ckpt["actor_state_dict"]
 
+    # load the policy onto device
     policy = ActorMLP().to(device)
     weight_map = {}
     for k, v in actor_sd.items():
@@ -81,24 +89,29 @@ def load_policy(checkpoint_path: str, device: torch.device) -> ActorMLP:
             weight_map["obs_var"] = v
     policy.load_state_dict(weight_map, strict=False)
     policy.eval()
+
     return policy
 
 
 ############################################################################
-# OBSERVATION / CONTROL
+# OBSERVATION / ACTION
 ############################################################################
 
 def build_observation(mj_data, robot_cfg, prev_action, nu, device):
     """Build the 80-dim observation vector consumed by the policy."""
+
+    # take mujoco state data
     omega = mj_data.sensordata[14:17].astype(np.float32)
     quat = mj_data.qpos[3:7].astype(np.float32)
     gravity = gravity_from_quat(quat)
     qpos_j = mj_data.qpos[7:7 + nu].astype(np.float32)
     qvel_j = mj_data.qvel[6:6 + nu].astype(np.float32)
 
+    # desired twist command (vx, vy, omega)
     cmd = np.asarray(robot_cfg.cmd, dtype=np.float32)
     default_j = np.asarray(robot_cfg.default_joint_pos, dtype=np.float32)
 
+    # robot gait phase
     phase = (mj_data.time % robot_cfg.gait_period) / robot_cfg.gait_period
     gait_phase = np.array(
         [math.sin(2.0 * math.pi * phase), math.cos(2.0 * math.pi * phase)],
@@ -107,6 +120,7 @@ def build_observation(mj_data, robot_cfg, prev_action, nu, device):
     if np.linalg.norm(cmd) < robot_cfg.stand_cmd_threshold:
         gait_phase[:] = 0.0
 
+    # build the observation vector
     obs = np.concatenate([
         omega,                  # 0:3
         gravity,                # 3:6
@@ -122,10 +136,15 @@ def build_observation(mj_data, robot_cfg, prev_action, nu, device):
 
 def compute_torque(action_np, mj_data, robot_cfg, nu):
     """PD torque from raw policy output."""
+    # scale action to get desired joint positions
     qpos_des = action_np * robot_cfg.action_scale + robot_cfg.default_joint_pos
+
+    # compute torque from PD (zero desired velocity)
     qpos_j = mj_data.qpos[7:7 + nu]
     qvel_j = mj_data.qvel[6:6 + nu]
-    return robot_cfg.Kp * (qpos_des - qpos_j) + robot_cfg.Kd * (-qvel_j)
+    tau = robot_cfg.Kp * (qpos_des - qpos_j) + robot_cfg.Kd * (-qvel_j)
+
+    return tau
 
 
 ############################################################################
@@ -134,32 +153,43 @@ def compute_torque(action_np, mj_data, robot_cfg, nu):
 
 def init_joystick():
     """Initialize pygame + joystick. Returns the joystick handle or None."""
+    
+    # initialize pygame
     pygame.init()
     pygame.joystick.init()
+    
+    # look for joysticks and initialize the first one we find (if any)
     if pygame.joystick.get_count() == 0:
         print("No joystick detected. Using default cmd from G1Config.")
         return None
     joy = pygame.joystick.Joystick(0)
     joy.init()
+
     print(f"Joystick connected: [{joy.get_name()}]. Driving cmd from joystick.")
     print("  Left stick:  forward/back -> vx,  left/right -> vy")
     print("  Right stick: left/right   -> yaw rate")
+
     return joy
 
 
-def update_cmd_from_joystick(joy, robot_cfg):
-    """Pump pygame events and write joystick state into robot_cfg.cmd in place."""
+def cmd_from_joystick(joy, cmd_scale):
+    """Pump pygame events and return a (vx, vy, omega) cmd, or None on read error."""
+
     # consume the event queue (also surfaces connect/disconnect)
     pygame.event.pump()
     try:
         state = pygame_to_joystick_state(joy)
     except pygame.error:
-        return
-    # remapping matches deploy_robot/joystick_pygame.py; scaled by cmd_scale
-    scale = robot_cfg.cmd_scale
-    robot_cfg.cmd[0] = state.LS_Y * scale[0]   # vx
-    robot_cfg.cmd[1] = state.LS_X * scale[1]   # vy
-    robot_cfg.cmd[2] = state.RS_X * scale[2]   # omega
+        return None
+    
+    # remap the raw joystick commands
+    cmd = np.array([
+        state.LS_Y * cmd_scale[0],   # vx
+        state.LS_X * cmd_scale[1],   # vy
+        state.RS_X * cmd_scale[2],   # omega
+    ], dtype=np.float32)
+
+    return cmd
 
 
 ############################################################################
@@ -167,6 +197,8 @@ def update_cmd_from_joystick(joy, robot_cfg):
 ############################################################################
 
 def main():
+
+    # parse command-line args
     parser = argparse.ArgumentParser()
     parser.add_argument("--xml", default="models/g1_23dof.xml",
                         help="path to MuJoCo XML")
@@ -181,16 +213,19 @@ def main():
     np.random.seed(0)
     torch.use_deterministic_algorithms(False)
 
+    # choose deive to do inference on
     device = torch.device("cpu")
 
     # robot + model setup
     robot_cfg = G1Config()
     nu = len(robot_cfg.Kp)
 
+    # load MuJoCo model and data
     mj_model = mujoco.MjModel.from_xml_path(args.xml)
     mj_model.opt.timestep = args.sim_dt
     mj_data = mujoco.MjData(mj_model)
 
+    # control decimation for policy queries
     control_ratio = robot_cfg.control_dt / args.sim_dt
     if not math.isclose(control_ratio, round(control_ratio), abs_tol=1e-9):
         raise ValueError(
@@ -214,26 +249,36 @@ def main():
     # joystick (optional — only used if connected at startup)
     joy = init_joystick()
 
-    # initialize the live cmd from cmd_default; joystick (if present) mutates it
+    # initialize the live cmd from cmd_default
     robot_cfg.cmd = np.asarray(robot_cfg.cmd_default, dtype=np.float32).copy()
 
+    # mujoco viewer setup
     render_dt = 1.0 / RENDER_HZ
     print(f"Viewer render rate: {RENDER_HZ:.0f} Hz. "
           "Close the viewer window to exit.")
 
+    # observation and action buffers
     prev_action = np.zeros(nu, dtype=np.float32)
     action = prev_action.copy()
     step = 0
 
+    # run the sim + viewer loop. 
     try:
-        with mujoco.viewer.launch_passive(mj_model, mj_data) as viewer:
+        with mujoco.viewer.launch_passive(
+            mj_model, mj_data, show_left_ui=False, show_right_ui=False
+        ) as viewer:
+            
+            # set camera for better view
+            viewer.cam.azimuth = 140
+            viewer.cam.elevation = -20
+            viewer.cam.distance = 3.0
+            viewer.cam.lookat[:] = (0.0, 0.0, 0.8)
+
             wall_start = time.time()
             next_render = wall_start
 
             while viewer.is_running():
                 # advance physics until sim time catches up to wall-clock time
-                # (cap catch-up at a few render frames to avoid the "spiral of
-                # death" if the host stalls)
                 sim_target = min(
                     time.time() - wall_start,
                     mj_data.time + 4.0 * render_dt,
@@ -241,7 +286,9 @@ def main():
                 while mj_data.time < sim_target:
                     if step % decimation == 0:
                         if joy is not None:
-                            update_cmd_from_joystick(joy, robot_cfg)
+                            new_cmd = cmd_from_joystick(joy, robot_cfg.cmd_scale)
+                            if new_cmd is not None:
+                                robot_cfg.cmd = new_cmd
                         obs = build_observation(mj_data, robot_cfg, prev_action, nu, device)
                         action = policy(obs).squeeze(0).cpu().numpy().astype(np.float32)
                         prev_action = action
