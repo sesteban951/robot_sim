@@ -1,5 +1,5 @@
 # robot_sim
-Forward simulation of robots under a trained RL policies.
+Forward simulation of humanoid robot under a trained RL policies.
 
 ## Install
 Create the conda environment:

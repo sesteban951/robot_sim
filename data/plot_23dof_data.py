@@ -1,6 +1,6 @@
 ##
 #
-#  Plot the full state of randomly sampled trajectories from a parallel_sim .npz dataset.
+#  Plot the full state of randomly sampled trajectories from a _23dof_data.npz dataset.
 #
 ##
 
@@ -10,6 +10,9 @@ import time
 
 import numpy as np
 import matplotlib.pyplot as plt
+
+import mujoco
+import mujoco.viewer
 
 # project root so we can import utils.math_utils
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -65,6 +68,56 @@ def plot_data(t, X, labels, title, n_cols=5, overlays=None, save_path=None):
         print(f"saved: {save_path}")
 
 
+def playback_trajectories(xml_path, q_sel, v_sel, sim_dt, idx, render_hz=50.0,
+                          loop=True):
+    """Replay selected (q, v) trajectories in a passive MuJoCo viewer, in sequence.
+
+    Drives mj_data.qpos / qvel from the logs (no physics integration) and calls
+    mj_forward to update kinematics + viewer. Real-time wall-clock paced.
+
+    If loop=True, cycles through all trajectories forever; close the viewer
+    window to stop.
+    """
+    model = mujoco.MjModel.from_xml_path(xml_path)
+    data = mujoco.MjData(model)
+
+    num, T, _ = q_sel.shape
+    render_dt = 1.0 / render_hz
+    step_skip = max(1, int(round(render_dt / sim_dt)))  # render every Nth log sample
+
+    print(f"\nPlaying back {num} trajectory(ies). "
+          f"Close the window to {'stop the loop' if loop else 'abort'}.")
+
+    with mujoco.viewer.launch_passive(
+        model, data, show_left_ui=False, show_right_ui=False
+    ) as viewer:
+        # camera matches single_sim.py
+        viewer.cam.azimuth = 140
+        viewer.cam.elevation = -20
+        viewer.cam.distance = 4.0
+        viewer.cam.lookat[:] = (0.0, 0.0, 0.8)
+
+        while True:
+            for traj_i in range(num):
+                print(f"  trajectory env_idx={idx[traj_i]} ({traj_i + 1}/{num})")
+                wall_start = time.time()
+                for k in range(0, T, step_skip):
+                    if not viewer.is_running():
+                        return
+
+                    target = wall_start + k * sim_dt
+                    slack = target - time.time()
+                    if slack > 0:
+                        time.sleep(slack)
+
+                    data.qpos[:] = q_sel[traj_i, k]
+                    data.qvel[:] = v_sel[traj_i, k]
+                    mujoco.mj_forward(model, data)
+                    viewer.sync()
+            if not loop:
+                break
+
+
 ############################################################################
 # MAIN
 ############################################################################
@@ -73,6 +126,7 @@ def main():
 
     # configuration
     data_path = "./data/data/g1_23dof_data_01.npz"
+    xml_path = "./models/g1_23dof.xml"
 
     # trajectories to plot
     num_trajectories = 3
@@ -107,8 +161,7 @@ def main():
     cmd_sel = cmd[idx]                # (num, T, 3)
     t = np.arange(T) * sim_dt         # (T,)
 
-    # cmd is in the body frame; rotate it to world frame to match v_log
-    # (which is the free-joint qvel — also world frame).
+    # cmd is in the body frame
     quat_sel = q_sel[:, :, 3:7]                                              # (num, T, 4) wxyz
     zero_col = np.zeros_like(cmd_sel[..., 0:1])
     cmd_lin_body = np.concatenate([cmd_sel[..., 0:2], zero_col], axis=-1)    # (num, T, 3) (vx, vy, 0)
@@ -123,9 +176,19 @@ def main():
         5: cmd_ang_world[:, :, 2],
     }
 
+    # Figures 1 & 2 — static traces (created, then shown non-blocking so they
+    # appear before the MuJoCo window opens)
     plot_data(t, q_sel, Q_LABELS, f"positions, q")
     plot_data(t, v_sel, V_LABELS, f"velocities, v", overlays=v_overlays)
+    plt.ion()
+    plt.show(block=False)
+    plt.pause(0.1)  # nudge the backend to actually paint the windows
 
+    # Figure 3 — looping MuJoCo playback (blocks until the viewer is closed)
+    playback_trajectories(xml_path, q_sel, v_sel, sim_dt, idx, loop=True)
+
+    # keep static figures visible after the MuJoCo viewer is closed
+    plt.ioff()
     plt.show()
 
 
