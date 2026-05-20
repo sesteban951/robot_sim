@@ -150,6 +150,10 @@ def main():
                         help="path to RSL-RL .pt checkpoint")
     parser.add_argument("--sim_dt", type=float, default=0.002,
                         help="physics timestep")
+    parser.add_argument("--cmd", type=float, nargs=3, default=None,
+                        metavar=("VX", "VY", "WZ"),
+                        help="initial velocity command [vx, vy, omega_z] in body frame "
+                             "(overridden by joystick when connected)")
     args = parser.parse_args()
 
     # determinism
@@ -189,6 +193,11 @@ def main():
     print(f"Loaded policy from [{args.policy}].")
     print(f"sim_dt={args.sim_dt}, control_dt={robot_cfg.control_dt}, "
           f"decimation={decimation}")
+
+    # apply CLI cmd if provided (joystick still overrides per control tick)
+    if args.cmd is not None:
+        robot_cfg.cmd = np.asarray(args.cmd, dtype=np.float32)
+        print(f"Initial cmd: {robot_cfg.cmd.tolist()}")
 
     # joystick (optional — only used if connected at startup)
     joy = init_joystick()
